@@ -12,16 +12,14 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import tensorflow as tf
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from PIL import Image
+from tflite_runtime.interpreter import Interpreter
+
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-tf.random.set_seed(42)
 np.random.seed(42)
 
 app = FastAPI(
@@ -59,18 +57,32 @@ ES_LABELS = {
 def es_label(folder_name: str) -> str:
     return ES_LABELS.get(folder_name, folder_name.replace("___", " – ").replace("__", " ").replace("_", " "))
 
-# Paths / estado global
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "modelo_multiple_enfermedades_hojas_de_plantas.keras"
 
-modelo = None
-class_names = None
-image_shape = (256, 256)
+# ===== Paths / estado global =====
+BASE_DIR = Path(__file__).resolve().parent
+
+# Nombre del archivo local (puedes cambiarlo con env MODEL_FILE)
+MODEL_FILE = os.getenv("MODEL_FILE", "model.tflite")
+MODEL_PATH = BASE_DIR / MODEL_FILE
+
+# Si usas Git LFS, pon MODEL_URL en Render para descargar el archivo real
+MODEL_URL = os.getenv("MODEL_URL", "")
+
+# Clases: puedes definir CLASSES (comma separated) o poner classes.txt
+CLASSES_ENV = os.getenv("CLASSES", "")
+
+interpreter: Optional[Interpreter] = None
+input_details = None
+output_details = None
+
+class_names: Optional[List[str]] = None
+image_shape = (256, 256)  # se ajustará según el modelo
 
 model_ready = asyncio.Event()
 model_error: Optional[str] = None
 
-# Schemas
+
+# ===== Schemas =====
 class PrediccionTop(BaseModel):
     nombre: str
     nombre_es: str
@@ -102,104 +114,181 @@ class ResultadoPrediccion(BaseModel):
     mensaje: Optional[str] = None
     razones_rechazo: Optional[List[str]] = None
 
+
 def _archivo_es_lfs_pointer(path: Path) -> bool:
+    """Detecta si el archivo es un puntero de Git LFS (chiquito y con texto git-lfs)."""
     if not path.exists():
         return False
-    if path.stat().st_size > 5_000_000:  # si ya pesa bastante, no es puntero
+    if path.stat().st_size > 5_000_000:
         return False
-    head = path.read_bytes()[:200]
-    return b"git-lfs" in head or b"oid sha256" in head
+    head = path.read_bytes()[:300]
+    return (b"git-lfs" in head) or (b"oid sha256" in head)
 
 def _descargar_modelo(url: str, dest: Path) -> None:
-    logger.info(f"⬇️ Descargando modelo desde URL a: {dest}")
+    logger.info(f"⬇️ Descargando modelo a: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
     logger.info(f"✅ Modelo descargado. Tamaño: {dest.stat().st_size/1024/1024:.2f} MB")
 
+def _cargar_clases() -> List[str]:
+    if CLASSES_ENV.strip():
+        return [x.strip() for x in CLASSES_ENV.split(",") if x.strip()]
+
+    classes_txt = BASE_DIR / "classes.txt"
+    if classes_txt.exists():
+        lines = [ln.strip() for ln in classes_txt.read_text(encoding="utf-8").splitlines()]
+        lines = [ln for ln in lines if ln]
+        if lines:
+            return lines
+
+    # fallback
+    return list(ES_LABELS.keys())
+
+
 async def _cargar_modelo_bg():
-    global modelo, class_names, model_error
+    global interpreter, input_details, output_details, class_names, image_shape, model_error
     try:
-        url = os.getenv("MODEL_URL")
-
-        # si falta el archivo o es puntero LFS, descargamos
+        # Si no existe o es puntero LFS: descargar desde MODEL_URL
         if (not MODEL_PATH.exists()) or _archivo_es_lfs_pointer(MODEL_PATH):
-            if not url:
-                raise RuntimeError("Falta MODEL_URL en variables de entorno para descargar el modelo.")
-            await asyncio.to_thread(_descargar_modelo, url, MODEL_PATH)
-
-        logger.info(f"📦 Cargando modelo desde: {MODEL_PATH}")
-        modelo_local = await asyncio.to_thread(load_model, str(MODEL_PATH))
-        modelo = modelo_local
-        logger.info("✅ Modelo cargado exitosamente")
-
-        # Clases
-        train_path = BASE_DIR / "dataset" / "train"
-        if train_path.exists():
-            def _leer_clases():
-                temp_datagen = ImageDataGenerator(rescale=1/255)
-                temp_generator = temp_datagen.flow_from_directory(
-                    str(train_path),
-                    target_size=image_shape,
-                    batch_size=1,
-                    class_mode="categorical",
-                    shuffle=False
+            if not MODEL_URL:
+                raise RuntimeError(
+                    "Falta el modelo. Sube un .tflite al repo o configura MODEL_URL en Render."
                 )
-                return list(temp_generator.class_indices.keys())
+            await asyncio.to_thread(_descargar_modelo, MODEL_URL, MODEL_PATH)
 
-            class_names = await asyncio.to_thread(_leer_clases)
-        else:
-            class_names = list(ES_LABELS.keys())
-            logger.warning("⚠️ No se encontró dataset/train, usando orden predeterminado de clases")
+        logger.info(f"📦 Cargando TFLite desde: {MODEL_PATH}")
+        interpreter_local = Interpreter(model_path=str(MODEL_PATH))
+        interpreter_local.allocate_tensors()
+
+        in_details = interpreter_local.get_input_details()
+        out_details = interpreter_local.get_output_details()
+
+        # Normalmente: [1, H, W, C]
+        in_shape = in_details[0]["shape"]
+        if len(in_shape) >= 3:
+            h, w = int(in_shape[1]), int(in_shape[2])
+            if h > 0 and w > 0:
+                image_shape = (h, w)
+
+        interpreter = interpreter_local
+        input_details = in_details
+        output_details = out_details
+
+        class_names = _cargar_clases()
+
+        # Aviso si no coincide cantidad de clases con salida del modelo
+        out_shape = out_details[0]["shape"]
+        n_out = int(out_shape[-1]) if len(out_shape) else None
+        if n_out and len(class_names) != n_out:
+            logger.warning(f"⚠️ Clases ({len(class_names)}) != salida del modelo ({n_out}). "
+                           f"Revisa el orden/cantidad de clases.")
+
+        logger.info(f"✅ Modelo listo. Input: {image_shape}, clases: {len(class_names)}")
 
     except Exception as e:
         model_error = str(e)
         logger.error(f"❌ Error al cargar el modelo: {model_error}")
+
     finally:
         model_ready.set()
 
+
 @app.on_event("startup")
 async def startup():
-    # No bloquea el arranque
     asyncio.create_task(_cargar_modelo_bg())
+
 
 async def asegurar_modelo():
     await model_ready.wait()
-    if modelo is None or class_names is None:
+    if interpreter is None or class_names is None:
         raise HTTPException(status_code=503, detail=f"Modelo no disponible: {model_error}")
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / (np.sum(e) + 1e-12)
+
+
+def _preprocesar_imagen(ruta_imagen: str) -> np.ndarray:
+    # PIL -> RGB -> resize -> float32 [0,1]
+    img = Image.open(ruta_imagen).convert("RGB")
+    img = img.resize(image_shape)
+    x = np.asarray(img, dtype=np.float32) / 255.0
+    x = np.expand_dims(x, axis=0)  # [1,H,W,C]
+    return x
+
+
+def _infer_tflite(x: np.ndarray) -> np.ndarray:
+    """Corre inferencia y devuelve vector de probabilidades (float)."""
+    in_info = input_details[0]
+    out_info = output_details[0]
+
+    x_in = x
+
+    # Ajuste por cuantización de entrada si aplica
+    if in_info["dtype"] in (np.uint8, np.int8):
+        scale, zero = in_info.get("quantization", (0.0, 0))
+        if scale and scale > 0:
+            x_in = (x_in / scale + zero).astype(in_info["dtype"])
+        else:
+            x_in = (x_in * 255.0).astype(in_info["dtype"])
+    else:
+        x_in = x_in.astype(in_info["dtype"])
+
+    interpreter.set_tensor(in_info["index"], x_in)
+    interpreter.invoke()
+    y = interpreter.get_tensor(out_info["index"])[0]
+
+    # De-cuantizar salida si aplica
+    if out_info["dtype"] in (np.uint8, np.int8):
+        scale, zero = out_info.get("quantization", (0.0, 0))
+        y = y.astype(np.float32)
+        if scale and scale > 0:
+            y = (y - zero) * scale
+
+    y = y.astype(np.float32)
+
+    # Si no parece probabilidad, aplicamos softmax
+    s = float(np.sum(y))
+    if not (0.98 <= s <= 1.02) or np.any(y < 0) or np.any(y > 1.0):
+        y = _softmax(y)
+
+    return y
+
 
 def predecir_imagen(ruta_imagen: str, umbral_confianza: float = 0.70, umbral_entropia: float = 0.75) -> Dict:
     if not os.path.exists(ruta_imagen):
         raise FileNotFoundError(f"No se encontró la imagen: {ruta_imagen}")
 
-    img = load_img(ruta_imagen, target_size=image_shape)
-    img_array = img_to_array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
+    x = _preprocesar_imagen(ruta_imagen)
+    pred = _infer_tflite(x)  # vector [n_clases]
 
-    prediccion = modelo.predict(img_array, verbose=0)
-    clase_pred_idx = int(np.argmax(prediccion[0]))
-    confianza = float(prediccion[0][clase_pred_idx])
+    clase_pred_idx = int(np.argmax(pred))
+    confianza = float(pred[clase_pred_idx])
 
     clase_pred_nombre = class_names[clase_pred_idx]
     clase_pred_es = es_label(clase_pred_nombre)
 
-    top3_idx = np.argsort(prediccion[0])[-3:][::-1]
+    top3_idx = np.argsort(pred)[-3:][::-1]
     top3 = [{
         "nombre": class_names[i],
         "nombre_es": es_label(class_names[i]),
-        "probabilidad": float(prediccion[0][i])
+        "probabilidad": float(pred[i])
     } for i in top3_idx]
 
     criterio_confianza = confianza >= umbral_confianza
 
-    entropia = -np.sum(prediccion[0] * np.log(prediccion[0] + 1e-10))
+    entropia = -float(np.sum(pred * np.log(pred + 1e-10)))
     entropia_normalizada = float(entropia / np.log(len(class_names)))
     criterio_entropia = entropia_normalizada <= umbral_entropia
 
-    gap_top1_top2 = float(prediccion[0][top3_idx[0]] - prediccion[0][top3_idx[1]])
+    gap_top1_top2 = float(pred[top3_idx[0]] - pred[top3_idx[1]])
     criterio_gap = gap_top1_top2 >= 0.20
 
-    suma_top3 = float(sum([prediccion[0][i] for i in top3_idx]))
+    suma_top3 = float(np.sum(pred[top3_idx]))
     criterio_concentracion = suma_top3 >= 0.80
 
     es_valida = criterio_confianza and criterio_entropia
@@ -243,16 +332,16 @@ def predecir_imagen(ruta_imagen: str, umbral_confianza: float = 0.70, umbral_ent
         "razones_rechazo": razones_rechazo
     }
 
+
 @app.post("/predecir", response_model=ResultadoPrediccion)
 async def predecir(
     file: UploadFile = File(...),
     umbral_confianza: float = 0.70,
     umbral_entropia: float = 0.75
 ):
-    """Endpoint para predecir enfermedades en hojas de plantas."""
     await asegurar_modelo()
 
-    if not file.content_type.startswith("image/"):
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="El archivo debe ser una imagen (JPG, JPEG, PNG)")
 
     temp_path = None
@@ -272,15 +361,27 @@ async def predecir(
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
 
+
 @app.get("/")
 async def root():
-    return {"mensaje": "API OK", "docs": "/docs", "health": "/health"}
+    return {"mensaje": "API OK", "docs": "/docs", "health": "/health", "clases": "/clases"}
+
+
+@app.get("/clases")
+async def clases():
+    await asegurar_modelo()
+    return {"total": len(class_names), "clases": [{"indice": i, "nombre": c, "nombre_es": es_label(c)} for i, c in enumerate(class_names)]}
+
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "modelo_cargando": not model_ready.is_set(),
-        "modelo_cargado": modelo is not None,
+        "modelo_cargado": interpreter is not None,
+        "model_file": str(MODEL_PATH),
+        "model_exists": MODEL_PATH.exists(),
+        "image_shape": list(image_shape),
+        "total_clases": len(class_names) if class_names else 0,
         "error": model_error
     }
