@@ -104,7 +104,8 @@ async def cargar_modelo():
     global modelo, class_names
     
     try:
-        MODEL_PATH = "modelo_multiple_enfermedades_hojas_de_plantas.keras"
+        BASE_DIR = Path(__file__).resolve().parent
+        MODEL_PATH = BASE_DIR / "modelo_multiple_enfermedades_hojas_de_plantas.keras"
         
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"No se encontró el modelo en: {MODEL_PATH}")
