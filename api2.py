@@ -11,7 +11,8 @@ from pydantic import BaseModel
 from typing import List, Dict, Optional
 import tempfile
 from pathlib import Path
-
+import asyncio
+from pathlib import Path
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -98,45 +99,46 @@ class ResultadoPrediccion(BaseModel):
     mensaje: Optional[str] = None
     razones_rechazo: Optional[List[str]] = None
 
-@app.on_event("startup")
-async def cargar_modelo():
-    """Carga el modelo y las clases al iniciar la aplicación"""
-    global modelo, class_names
-    
+async def _cargar_modelo_bg():
+    global modelo, class_names, model_error
     try:
-        BASE_DIR = Path(__file__).resolve().parent
-        MODEL_PATH = str(BASE_DIR / "modelo_multiple_enfermedades_hojas_de_plantas.keras")
-        
-        if not os.path.exists(MODEL_PATH):
+        if not MODEL_PATH.exists():
             raise FileNotFoundError(f"No se encontró el modelo en: {MODEL_PATH}")
-        
+
         logger.info(f"Cargando modelo desde: {MODEL_PATH}")
-        modelo = load_model(MODEL_PATH)
+        modelo = load_model(str(MODEL_PATH))
         logger.info("✅ Modelo cargado exitosamente")
-        
-        # Obtener orden de clases desde el dataset
-        train_path = "dataset/train"
-        
-        if os.path.exists(train_path):
+
+        train_path = BASE_DIR / "dataset" / "train"
+        if train_path.exists():
             temp_datagen = ImageDataGenerator(rescale=1/255)
             temp_generator = temp_datagen.flow_from_directory(
-                train_path,
+                str(train_path),
                 target_size=image_shape,
                 batch_size=1,
                 class_mode="categorical",
                 shuffle=False
             )
             class_names = list(temp_generator.class_indices.keys())
-            logger.info(f"✅ Clases cargadas: {len(class_names)} categorías")
         else:
-            # Fallback: usar orden basado en ES_LABELS
             class_names = list(ES_LABELS.keys())
-            logger.warning(f"⚠️ No se encontró dataset, usando orden predeterminado de clases")
-            
-    except Exception as e:
-        logger.error(f"❌ Error al cargar el modelo: {str(e)}")
-        raise
+            logger.warning("⚠️ No se encontró dataset, usando orden predeterminado de clases")
 
+    except Exception as e:
+        model_error = str(e)
+        logger.error(f"❌ Error al cargar el modelo: {model_error}")
+    finally:
+        model_ready.set()
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_cargar_modelo_bg())  # NO bloquear
+
+async def asegurar_modelo():
+    await model_ready.wait()
+    if modelo is None or class_names is None:
+        raise HTTPException(status_code=503, detail=f"Modelo no disponible: {model_error}")
+    
 def predecir_imagen(
     ruta_imagen: str,
     umbral_confianza: float = 0.70,
@@ -240,6 +242,7 @@ async def predecir(
     umbral_confianza: float = 0.70,
     umbral_entropia: float = 0.75
 ):
+    await asegurar_modelo()
     """
     Endpoint para predecir enfermedades en hojas de plantas.
     
@@ -319,13 +322,13 @@ async def obtener_clases():
 
 @app.get("/health")
 async def health_check():
-    """Verifica el estado de la API"""
     return {
         "status": "healthy",
+        "modelo_cargando": not model_ready.is_set(),
         "modelo_cargado": modelo is not None,
-        "clases_cargadas": class_names is not None,
-        "total_clases": len(class_names) if class_names else 0
+        "error": model_error
     }
+
 
 if __name__ == "__main__":
     import uvicorn
