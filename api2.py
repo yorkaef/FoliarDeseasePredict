@@ -10,9 +10,9 @@ import tensorflow as tf
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import tempfile
-from pathlib import Path
 import asyncio
 from pathlib import Path
+
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,7 +66,10 @@ def es_label(folder_name: str) -> str:
 modelo = None
 class_names = None
 image_shape = (256, 256)
-
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "modelo_multiple_enfermedades_hojas_de_plantas.keras"
+model_ready = asyncio.Event()
+model_error = None
 # Modelos Pydantic para respuestas
 class PrediccionTop(BaseModel):
     nombre: str
@@ -98,6 +101,7 @@ class ResultadoPrediccion(BaseModel):
     top3: List[PrediccionTop]
     mensaje: Optional[str] = None
     razones_rechazo: Optional[List[str]] = None
+
 
 async def _cargar_modelo_bg():
     global modelo, class_names, model_error
@@ -242,7 +246,7 @@ async def predecir(
     umbral_confianza: float = 0.70,
     umbral_entropia: float = 0.75
 ):
-    await asegurar_modelo()
+    
     """
     Endpoint para predecir enfermedades en hojas de plantas.
     
@@ -254,7 +258,8 @@ async def predecir(
     Returns:
         Resultado de la predicción con métricas detalladas
     """
-    
+    await asegurar_modelo()
+
     # Validar tipo de archivo
     if not file.content_type.startswith("image/"):
         raise HTTPException(
@@ -285,8 +290,7 @@ async def predecir(
         raise HTTPException(status_code=500, detail=f"Error al procesar la imagen: {str(e)}")
     
     finally:
-        # Limpiar archivo temporal
-        if os.path.exists(temp_path):
+        if "temp_path" in locals() and os.path.exists(temp_path):
             os.unlink(temp_path)
 
 @app.get("/")
